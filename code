@@ -1,0 +1,230 @@
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <UniversalTelegramBot.h>
+
+// Konfigurasi WiFi
+const char* ssid = "NAMA_WIFI_ANDA";
+const char* password = "PASSWORD_WIFI_ANDA";
+
+// Token Bot Telegram (dapatkan dari @BotFather)
+#define BOT_TOKEN "MASUKKAN_TOKEN_BOT_ANDA"
+#define CHAT_ID "MASUKKAN_CHAT_ID_ANDA"
+
+// Pin Configuration
+#define SOIL_SENSOR_PIN 34      // Pin analog untuk sensor kelembapan tanah
+#define RELAY_PUMP_PIN 26       // Pin relay untuk pompa air
+#define RELAY_LIGHT_PIN 27      // Pin relay untuk lampu 24W
+#define LED_INDICATOR_PIN 2     // LED internal ESP32
+
+// Pengaturan
+int soilMoistureThreshold = 40;  // Persen kelembapan minimum (siram jika dibawah ini)
+bool autoMode = true;             // Mode otomatis aktif
+bool pumpState = false;
+bool lightState = false;
+unsigned long lastMoistureCheck = 0;
+const long moistureCheckInterval = 60000; // Cek setiap 1 menit
+
+WiFiClientSecure client;
+UniversalTelegramBot bot(BOT_TOKEN, client);
+
+unsigned long lastTimeBotRan = 0;
+const long botRequestDelay = 1000;
+
+// Fungsi membaca kelembapan tanah (0-100%)
+int readSoilMoisture() {
+  int sensorValue = analogRead(SOIL_SENSOR_PIN);
+  // Konversi ke persen (sesuaikan nilai min/max dengan sensor Anda)
+  // Asumsi: 4095 (kering) -> 0%, 1500 (basah) -> 100%
+  int moisture = map(sensorValue, 4095, 1500, 0, 100);
+  moisture = constrain(moisture, 0, 100);
+  return moisture;
+}
+
+// Fungsi kontrol pompa
+void controlPump(bool state) {
+  pumpState = state;
+  digitalWrite(RELAY_PUMP_PIN, state ? LOW : HIGH); // Relay aktif LOW
+  digitalWrite(LED_INDICATOR_PIN, state);
+  String status = state ? "MENYALA ✅" : "MATI ❌";
+  Serial.println("Pompa: " + status);
+}
+
+// Fungsi kontrol lampu
+void controlLight(bool state) {
+  lightState = state;
+  digitalWrite(RELAY_LIGHT_PIN, state ? LOW : HIGH); // Relay aktif LOW
+  String status = state ? "MENYALA 💡" : "MATI 🌙";
+  Serial.println("Lampu: " + status);
+}
+
+// Handle pesan Telegram
+void handleNewMessages(int numNewMessages) {
+  for (int i = 0; i < numNewMessages; i++) {
+    String chat_id = String(bot.messages[i].chat_id);
+    String text = bot.messages[i].text;
+    String from_name = bot.messages[i].from_name;
+    
+    Serial.println("Pesan dari " + from_name + ": " + text);
+    
+    // Command: /start
+    if (text == "/start") {
+      String welcome = "🌱 *Sistem Penyiram Taman Otomatis* 🌱\n\n";
+      welcome += "Halo " + from_name + "! Selamat datang!\n\n";
+      welcome += "*Perintah yang tersedia:*\n";
+      welcome += "/status - Cek status sistem\n";
+      welcome += "/pompa_on - Nyalakan pompa\n";
+      welcome += "/pompa_off - Matikan pompa\n";
+      welcome += "/lampu_on - Nyalakan lampu\n";
+      welcome += "/lampu_off - Matikan lampu\n";
+      welcome += "/auto_on - Aktifkan mode otomatis\n";
+      welcome += "/auto_off - Nonaktifkan mode otomatis\n";
+      welcome += "/set_threshold_XX - Set threshold kelembapan (XX = 0-100)\n";
+      welcome += "Contoh: /set_threshold_35\n";
+      bot.sendMessage(chat_id, welcome, "Markdown");
+    }
+    
+    // Command: /status
+    else if (text == "/status") {
+      int moisture = readSoilMoisture();
+      String status = "📊 *STATUS SISTEM*\n\n";
+      status += "💧 Kelembapan Tanah: *" + String(moisture) + "%*\n";
+      status += "💦 Pompa: " + String(pumpState ? "MENYALA ✅" : "MATI ❌") + "\n";
+      status += "💡 Lampu: " + String(lightState ? "MENYALA ✅" : "MATI ❌") + "\n";
+      status += "🤖 Mode Auto: " + String(autoMode ? "AKTIF ✅" : "NON-AKTIF ❌") + "\n";
+      status += "⚙️ Threshold: *" + String(soilMoistureThreshold) + "%*\n";
+      bot.sendMessage(chat_id, status, "Markdown");
+    }
+    
+    // Command: Pompa ON
+    else if (text == "/pompa_on") {
+      controlPump(true);
+      autoMode = false; // Matikan auto mode saat manual
+      bot.sendMessage(chat_id, "💦 Pompa DINYALAKAN\n(Mode auto dinonaktifkan)");
+    }
+    
+    // Command: Pompa OFF
+    else if (text == "/pompa_off") {
+      controlPump(false);
+      bot.sendMessage(chat_id, "💦 Pompa DIMATIKAN");
+    }
+    
+    // Command: Lampu ON
+    else if (text == "/lampu_on") {
+      controlLight(true);
+      bot.sendMessage(chat_id, "💡 Lampu DINYALAKAN");
+    }
+    
+    // Command: Lampu OFF
+    else if (text == "/lampu_off") {
+      controlLight(false);
+      bot.sendMessage(chat_id, "💡 Lampu DIMATIKAN");
+    }
+    
+    // Command: Auto ON
+    else if (text == "/auto_on") {
+      autoMode = true;
+      bot.sendMessage(chat_id, "🤖 Mode OTOMATIS diaktifkan\nSistem akan menyiram otomatis jika kelembapan < " + String(soilMoistureThreshold) + "%");
+    }
+    
+    // Command: Auto OFF
+    else if (text == "/auto_off") {
+      autoMode = false;
+      bot.sendMessage(chat_id, "🤖 Mode OTOMATIS dinonaktifkan");
+    }
+    
+    // Command: Set Threshold
+    else if (text.startsWith("/set_threshold_")) {
+      String valueStr = text.substring(15);
+      int newThreshold = valueStr.toInt();
+      if (newThreshold >= 0 && newThreshold <= 100) {
+        soilMoistureThreshold = newThreshold;
+        bot.sendMessage(chat_id, "⚙️ Threshold diubah menjadi: *" + String(soilMoistureThreshold) + "%*", "Markdown");
+      } else {
+        bot.sendMessage(chat_id, "❌ Nilai tidak valid! Gunakan 0-100\nContoh: /set_threshold_40");
+      }
+    }
+    
+    else {
+      bot.sendMessage(chat_id, "❓ Perintah tidak dikenal. Ketik /start untuk melihat daftar perintah.");
+    }
+  }
+}
+
+// Mode otomatis - cek kelembapan dan siram jika perlu
+void checkAutoMode() {
+  if (!autoMode) return;
+  
+  unsigned long currentMillis = millis();
+  if (currentMillis - lastMoistureCheck >= moistureCheckInterval) {
+    lastMoistureCheck = currentMillis;
+    
+    int moisture = readSoilMoisture();
+    Serial.println("Kelembapan: " + String(moisture) + "%");
+    
+    // Jika terlalu kering, nyalakan pompa
+    if (moisture < soilMoistureThreshold && !pumpState) {
+      controlPump(true);
+      String msg = "🚨 *PENYIRAMAN OTOMATIS*\n\n";
+      msg += "Kelembapan tanah: *" + String(moisture) + "%*\n";
+      msg += "Threshold: *" + String(soilMoistureThreshold) + "%*\n";
+      msg += "Pompa dinyalakan untuk menyiram tanaman 💦";
+      bot.sendMessage(CHAT_ID, msg, "Markdown");
+    }
+    // Jika sudah cukup basah, matikan pompa
+    else if (moisture >= (soilMoistureThreshold + 10) && pumpState) {
+      controlPump(false);
+      String msg = "✅ *PENYIRAMAN SELESAI*\n\n";
+      msg += "Kelembapan tanah: *" + String(moisture) + "%*\n";
+      msg += "Pompa dimatikan. Tanaman sudah cukup air 🌱";
+      bot.sendMessage(CHAT_ID, msg, "Markdown");
+    }
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  
+  // Setup pins
+  pinMode(RELAY_PUMP_PIN, OUTPUT);
+  pinMode(RELAY_LIGHT_PIN, OUTPUT);
+  pinMode(LED_INDICATOR_PIN, OUTPUT);
+  pinMode(SOIL_SENSOR_PIN, INPUT);
+  
+  // Matikan semua relay di awal
+  digitalWrite(RELAY_PUMP_PIN, HIGH);
+  digitalWrite(RELAY_LIGHT_PIN, HIGH);
+  digitalWrite(LED_INDICATOR_PIN, LOW);
+  
+  // Koneksi WiFi
+  Serial.print("Menghubungkan ke WiFi");
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+  client.setInsecure(); // Untuk koneksi Telegram
+  
+  while (WiFi.status() != WL_CONNECTED) {
+    Serial.print(".");
+    delay(500);
+  }
+  
+  Serial.println("\nWiFi terhubung!");
+  Serial.print("IP Address: ");
+  Serial.println(WiFi.localIP());
+  
+  // Kirim notifikasi startup
+  bot.sendMessage(CHAT_ID, "🌱 Sistem Penyiram Taman ONLINE!\nKetik /start untuk melihat perintah.");
+}
+
+void loop() {
+  // Cek pesan baru dari Telegram
+  if (millis() - lastTimeBotRan > botRequestDelay) {
+    int numNewMessages = bot.getUpdates(bot.last_message_received + 1);
+    while (numNewMessages) {
+      handleNewMessages(numNewMessages);
+      numNewMessages = bot.getUpdates(bot.last_message_received + 1);
+    }
+    lastTimeBotRan = millis();
+  }
+  
+  // Jalankan mode otomatis
+  checkAutoMode();
+}
